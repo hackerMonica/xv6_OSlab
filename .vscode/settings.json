@@ -1,5 +1,6 @@
 {
     "files.associations": {
-        "user.h": "c"
+        "*.php": "php",
+        "proc.h": "c"
     }
 }

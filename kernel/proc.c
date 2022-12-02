@@ -15,11 +15,31 @@ struct proc *initproc;
 int nextpid = 1;
 struct spinlock pid_lock;
 
+extern pagetable_t kernel_pagetable;
 extern void forkret(void);
 static void wakeup1(struct proc *chan);
 static void freeproc(struct proc *p);
 
 extern char trampoline[]; // trampoline.S
+
+/**
+ * Copy user_pagetable's leaf entry found by 'walk' function
+ * to kernal_pagetable.
+ * Set this function at proc.c for using 'struct proc' easily,
+ * which can decrease the parameters' number.
+ * In most situations, the start and sz even are needless,
+ * but only 'growproc' needs different range, so I have to keep
+ * the two parameters.
+ */
+void
+pagetableCopy(struct proc* p, uint64 start, uint64 sz){
+  for (uint64 i = PGROUNDUP(start); i < start+sz; i+=PGSIZE)
+  {
+    pte_t *k_pte = walk(p->k_pagetable,i,114514);
+    pte_t *pte   = walk(p->pagetable,i,0);
+    (*k_pte)=*pte;
+  }
+}
 
 // initialize the proc table at boot time.
 void
@@ -40,6 +60,7 @@ procinit(void)
       uint64 va = KSTACK((int) (p - proc));
       kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
       p->kstack = va;
+      p->kstack_pa=(uint64)pa;
   }
   kvminithart();
 }
@@ -112,6 +133,9 @@ found:
     release(&p->lock);
     return 0;
   }
+  p->k_pagetable=kvminit_single();
+  uint64 va = KSTACK((int) (p - proc));
+  kvmmap_single(p->k_pagetable, va, p->kstack_pa, PGSIZE, PTE_R | PTE_W);
 
   // An empty user page table.
   p->pagetable = proc_pagetable(p);
@@ -128,6 +152,20 @@ found:
   p->context.sp = p->kstack + PGSIZE;
 
   return p;
+}
+
+void
+freeproc_traceback(pagetable_t pagetable){
+  for(int i = 0; i < 512; i++){
+    pte_t pte = pagetable[i];
+    if((pte & PTE_V) && (pte & (PTE_R|PTE_W|PTE_X)) == 0){
+      // this PTE points to a lower-level page table.
+      uint64 child = PTE2PA(pte);
+      freeproc_traceback((pagetable_t)child);
+      pagetable[i] = 0;  
+    }
+  }
+  kfree((void*)pagetable);
 }
 
 // free a proc structure and the data hanging from it,
@@ -150,6 +188,7 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+  freeproc_traceback(p->k_pagetable);
 }
 
 // Create a user page table for a given process,
@@ -230,6 +269,7 @@ userinit(void)
 
   p->state = RUNNABLE;
 
+  pagetableCopy(p,0,p->sz);
   release(&p->lock);
 }
 
@@ -246,8 +286,11 @@ growproc(int n)
     if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
       return -1;
     }
+    pagetableCopy(p,sz-n,n);
   } else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
+    int npages = (PGROUNDUP(sz-n) - PGROUNDUP(sz)) / PGSIZE;
+    uvmunmap(p->k_pagetable, PGROUNDUP(sz), npages, 0);
   }
   p->sz = sz;
   return 0;
@@ -295,6 +338,7 @@ fork(void)
 
   np->state = RUNNABLE;
 
+  pagetableCopy(np,0,p->sz);
   release(&np->lock);
 
   return pid;
@@ -473,7 +517,11 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+        w_satp(MAKE_SATP(p->k_pagetable));
+        sfence_vma();
         swtch(&c->context, &p->context);
+        w_satp(MAKE_SATP(kernel_pagetable));
+        sfence_vma();
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
